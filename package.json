@@ -1,0 +1,22 @@
+{
+  "name": "project-management-system",
+  "version": "1.0.0",
+  "description": "A Project Management Application.",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "dev": "node index.js"
+  },
+  "keywords": [
+    "BackEnd",
+    "API",
+    "Creation",
+    "Node.js",
+    "Project"
+  ],
+  "author": "Niraj Chouhan",
+  "license": "ISC",
+  "devDependencies": {
+    "prettier": "3.7.4"
+  }
+}
