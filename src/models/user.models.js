@@ -36,7 +36,7 @@ const userSchema = new Schema(
         },
         password: {
             type: String,
-            required: [true,"Password is mandatory!"]
+            required: [true, "Password is mandatory!"]
         },
         isEmailVerified: {
             type: Boolean,
@@ -63,17 +63,17 @@ const userSchema = new Schema(
     }
 );
 
-userSchema.pre("save", async function() {
+userSchema.pre("save", async function () {
     if (!this.isModified("password")) return;
 
     this.password = await bcrypt.hash(this.password, 10);
 });
 
-userSchema.methods.isPaswordCorrect = async function (password) {
-    return await bcrypt.compare(password, this.password);   
+userSchema.methods.isPasswordCorrect = async function (password) {
+    return await bcrypt.compare(password, this.password);
 };
 
-userSchema.methods.generateAccessTokens = function() {
+userSchema.methods.generateAccessTokens = function () {
     return jwt.sign(
         {
             _id: this._id,
@@ -81,23 +81,24 @@ userSchema.methods.generateAccessTokens = function() {
             username: this.username,
         },
         process.env.ACCESS_TOKEN_SECRET,
-        {expiresIn: process.env.ACCESS_TOKEN_EXPIRY}
+        { expiresIn: process.env.ACCESS_TOKEN_EXPIRY }
 
     );
 };
 
-userSchema.methods.generateRefreshTokens = function() {
+userSchema.methods.generateRefreshTokens = function () {
     return jwt.sign(
         {
             _id: this._id,
         },
         process.env.REFRESH_TOKEN_SECRET,
-        {expiresIn: process.env.REFRESH_TOKEN_EXPIRY
+        {
+            expiresIn: process.env.REFRESH_TOKEN_EXPIRY
         }
     );
 };
 
-userSchema.methods.generateTemporaryTokens = function() {
+userSchema.methods.generateTemporaryTokens = function () {
     const unHashedToken = crypto.randomBytes(20).toString("hex");
 
     const hashedToken = crypto
@@ -105,9 +106,9 @@ userSchema.methods.generateTemporaryTokens = function() {
         .update(unHashedToken)
         .digest("hex");
 
-    const tokenExpiry = Date.now() + (20*60*1000); // 20 minutes
+    const tokenExpiry = Date.now() + (20 * 60 * 1000); // 20 minutes
 
-    return {unHashedToken, hashedToken, tokenExpiry}
+    return { unHashedToken, hashedToken, tokenExpiry }
 };
 
 
