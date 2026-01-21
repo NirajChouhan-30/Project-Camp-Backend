@@ -56,6 +56,11 @@ const userSchema = new Schema(
         },
         emailVerificationExpiry: {
             type: Date
+        },
+        role: {
+            type: String,
+            enum: ['admin', 'project_admin', 'member'],
+            default: 'member'
         }
     },
     {
