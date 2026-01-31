@@ -28,7 +28,8 @@ const projectMemberSchema = new Schema(
         }
     },
     {
-        timestamps: true
+        timestamps: true,
+        optimisticConcurrency: true // Enable optimistic locking with version key
     }
 );
 

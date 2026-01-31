@@ -7,6 +7,7 @@ import { Task } from "../models/task.models.js";
 import { Subtask } from "../models/subtask.models.js";
 import { Note } from "../models/note.models.js";
 import mongoose from "mongoose";
+import { retryWithOptimisticLocking, retryOperation } from "../utils/retry-handler.js";
 
 /**
  * Create a new project (Admin only)
@@ -29,40 +30,48 @@ export const createProject = asyncHandler(async (req, res) => {
     // Validate description if provided
     const trimmedDescription = description ? description.trim() : "";
 
-    // Start a session for atomic transaction
-    const session = await mongoose.startSession();
-    session.startTransaction();
+    // Use retry logic to handle transient transaction errors (Requirement 11.4)
+    const project = await retryOperation(async () => {
+        // Start a session for atomic transaction
+        const session = await mongoose.startSession();
+        session.startTransaction();
 
-    try {
-        // Create the project within transaction
-        const [project] = await Project.create([{
-            name: trimmedName,
-            description: trimmedDescription,
-            owner: req.user._id
-        }], { session });
+        try {
+            // Create the project within transaction
+            const [newProject] = await Project.create([{
+                name: trimmedName,
+                description: trimmedDescription,
+                owner: req.user._id
+            }], { session });
 
-        // Automatically add creator as member with admin role within transaction
-        await ProjectMember.create([{
-            project: project._id,
-            user: req.user._id,
-            role: 'admin',
-            addedBy: req.user._id
-        }], { session });
+            // Automatically add creator as member with admin role within transaction
+            await ProjectMember.create([{
+                project: newProject._id,
+                user: req.user._id,
+                role: 'admin',
+                addedBy: req.user._id
+            }], { session });
 
-        // Commit the transaction
-        await session.commitTransaction();
+            // Commit the transaction
+            await session.commitTransaction();
 
-        res.status(201).json(
-            new ApiResponse(201, project, "Project created successfully")
-        );
-    } catch (error) {
-        // Rollback transaction on error
-        await session.abortTransaction();
-        throw error;
-    } finally {
-        // End the session
-        session.endSession();
-    }
+            return newProject;
+        } catch (error) {
+            // Rollback transaction on error
+            await session.abortTransaction();
+            throw error;
+        } finally {
+            // End the session
+            session.endSession();
+        }
+    }, {
+        maxRetries: 3,
+        initialDelay: 100
+    });
+
+    res.status(201).json(
+        new ApiResponse(201, project, "Project created successfully")
+    );
 });
 
 /**
@@ -182,33 +191,44 @@ export const updateProject = asyncHandler(async (req, res) => {
     // Authorization check is handled by verifyProjectMembership and verifyProjectRole middleware
     // This ensures the user is a member with admin role (Requirements 4.2, 4.4)
 
-    // Fetch the project (already verified to exist by middleware)
-    const project = await Project.findById(projectId);
+    // Use retry logic with optimistic locking to handle concurrent updates (Requirement 11.4)
+    const updatedProject = await retryWithOptimisticLocking(
+        // Fetch fresh document
+        async () => {
+            const project = await Project.findById(projectId);
+            if (!project) {
+                throw new ApiError(404, "Project not found");
+            }
+            return project;
+        },
+        // Apply updates
+        async (project) => {
+            // Ensure partial update support - only update provided fields (Requirement 4.1)
+            if (name !== undefined) {
+                // Comprehensive input validation for name (Requirement 4.3)
+                const trimmedName = name.trim();
+                if (!trimmedName) {
+                    throw new ApiError(400, "Project name cannot be empty or contain only whitespace");
+                }
+                project.name = trimmedName;
+            }
 
-    if (!project) {
-        throw new ApiError(404, "Project not found");
-    }
+            if (description !== undefined) {
+                project.description = description.trim();
+            }
 
-    // Ensure partial update support - only update provided fields (Requirement 4.1)
-    if (name !== undefined) {
-        // Comprehensive input validation for name (Requirement 4.3)
-        const trimmedName = name.trim();
-        if (!trimmedName) {
-            throw new ApiError(400, "Project name cannot be empty or contain only whitespace");
+            // Save will preserve creation timestamp and update metadata automatically (Requirement 4.5)
+            // Mongoose automatically updates the updatedAt field while preserving createdAt
+            // The save operation is handled by retryWithOptimisticLocking
+        },
+        {
+            maxRetries: 3,
+            initialDelay: 100
         }
-        project.name = trimmedName;
-    }
-
-    if (description !== undefined) {
-        project.description = description.trim();
-    }
-
-    // Save will preserve creation timestamp and update metadata automatically (Requirement 4.5)
-    // Mongoose automatically updates the updatedAt field while preserving createdAt
-    await project.save();
+    );
 
     res.status(200).json(
-        new ApiResponse(200, project, "Project updated successfully")
+        new ApiResponse(200, updatedProject, "Project updated successfully")
     );
 });
 
@@ -230,45 +250,51 @@ export const deleteProject = asyncHandler(async (req, res) => {
         throw new ApiError(404, "Project not found");
     }
 
-    // Start a session for atomic transaction (Requirement 5.4)
-    const session = await mongoose.startSession();
-    session.startTransaction();
+    // Use retry logic to handle transient transaction errors (Requirement 11.4)
+    await retryOperation(async () => {
+        // Start a session for atomic transaction (Requirement 5.4)
+        const session = await mongoose.startSession();
+        session.startTransaction();
 
-    try {
-        // Get all tasks for this project
-        const tasks = await Task.find({ project: projectId }).session(session);
-        const taskIds = tasks.map(task => task._id);
+        try {
+            // Get all tasks for this project
+            const tasks = await Task.find({ project: projectId }).session(session);
+            const taskIds = tasks.map(task => task._id);
 
-        // Cascade deletion in proper order (Requirement 5.1, 5.4):
-        // 1. Delete all subtasks associated with tasks in this project
-        await Subtask.deleteMany({ task: { $in: taskIds } }).session(session);
+            // Cascade deletion in proper order (Requirement 5.1, 5.4):
+            // 1. Delete all subtasks associated with tasks in this project
+            await Subtask.deleteMany({ task: { $in: taskIds } }).session(session);
 
-        // 2. Delete all tasks in this project
-        await Task.deleteMany({ project: projectId }).session(session);
+            // 2. Delete all tasks in this project
+            await Task.deleteMany({ project: projectId }).session(session);
 
-        // 3. Delete all notes in this project
-        await Note.deleteMany({ project: projectId }).session(session);
+            // 3. Delete all notes in this project
+            await Note.deleteMany({ project: projectId }).session(session);
 
-        // 4. Delete all project memberships
-        await ProjectMember.deleteMany({ project: projectId }).session(session);
+            // 4. Delete all project memberships
+            await ProjectMember.deleteMany({ project: projectId }).session(session);
 
-        // 5. Delete the project itself
-        await Project.findByIdAndDelete(projectId).session(session);
+            // 5. Delete the project itself
+            await Project.findByIdAndDelete(projectId).session(session);
 
-        // Commit the transaction (Requirement 5.4)
-        await session.commitTransaction();
+            // Commit the transaction (Requirement 5.4)
+            await session.commitTransaction();
+        } catch (error) {
+            // Rollback transaction on error (Requirement 5.4)
+            await session.abortTransaction();
+            throw error;
+        } finally {
+            // End the session
+            session.endSession();
+        }
+    }, {
+        maxRetries: 3,
+        initialDelay: 100
+    });
 
-        res.status(200).json(
-            new ApiResponse(200, null, "Project deleted successfully")
-        );
-    } catch (error) {
-        // Rollback transaction on error (Requirement 5.4)
-        await session.abortTransaction();
-        throw error;
-    } finally {
-        // End the session
-        session.endSession();
-    }
+    res.status(200).json(
+        new ApiResponse(200, null, "Project deleted successfully")
+    );
 });
 
 /**
@@ -369,63 +395,97 @@ export const getProjectMembers = asyncHandler(async (req, res) => {
 /**
  * Update a member's role in a project (Admin only)
  * PUT /api/v1/projects/:projectId/members/:userId
+ * Requirements: 8.1, 8.2, 8.3, 8.4, 8.5
  */
 export const updateProjectMemberRole = asyncHandler(async (req, res) => {
     const { projectId, userId } = req.params;
     const { role } = req.body;
+
+    // Authorization check is handled by verifyProjectMembership and verifyProjectRole middleware
+    // This ensures the user is a member with admin role (Requirements 8.2, 8.5)
+    // verifyProjectMembership ensures admin is a member of the project (Requirement 8.5)
+    // verifyProjectRole(['admin']) ensures only admins can update roles (Requirement 8.2)
 
     // Validate required fields
     if (!role) {
         throw new ApiError(400, "Role is required");
     }
 
-    // Validate role value
+    // Validate role value (Requirement 8.4)
     const validRoles = ['admin', 'project_admin', 'member'];
     if (!validRoles.includes(role)) {
         throw new ApiError(400, `Invalid role. Must be one of: ${validRoles.join(', ')}`);
     }
 
-    // Find the membership
-    const membership = await ProjectMember.findOne({
-        project: projectId,
-        user: userId
-    });
+    // Use retry logic with optimistic locking to handle concurrent updates (Requirement 11.4)
+    const updatedMembership = await retryWithOptimisticLocking(
+        // Fetch fresh document
+        async () => {
+            const membership = await ProjectMember.findOne({
+                project: projectId,
+                user: userId
+            });
 
-    if (!membership) {
-        throw new ApiError(404, "Member not found in this project");
-    }
+            // Handle non-existent members appropriately (Requirement 8.3)
+            if (!membership) {
+                throw new ApiError(404, "Member not found in this project");
+            }
 
-    // Update the role
-    membership.role = role;
-    await membership.save();
+            return membership;
+        },
+        // Apply updates
+        async (membership) => {
+            // Update only the role field, preserving other fields (Requirement 8.1)
+            // Using .save() ensures only the role field is modified while preserving:
+            // - joinedAt timestamp
+            // - addedBy reference
+            // - project reference
+            // - user reference
+            membership.role = role;
+            // The save operation is handled by retryWithOptimisticLocking
+        },
+        {
+            maxRetries: 3,
+            initialDelay: 100
+        }
+    );
 
-    // Populate user details for response
-    await membership.populate('user', 'username email');
-    await membership.populate('addedBy', 'username email');
+    // Populate user details for response (Requirement 8.1)
+    await updatedMembership.populate('user', 'username email fullName');
+    await updatedMembership.populate('addedBy', 'username email');
 
     res.status(200).json(
-        new ApiResponse(200, membership, "Member role updated successfully")
+        new ApiResponse(200, updatedMembership, "Member role updated successfully")
     );
 });
 
 /**
  * Remove a member from a project (Admin only)
  * DELETE /api/v1/projects/:projectId/members/:userId
+ * Requirements: 9.1, 9.2, 9.3, 9.4, 9.5
  */
 export const removeProjectMember = asyncHandler(async (req, res) => {
     const { projectId, userId } = req.params;
 
-    // Find the membership
+    // Authorization check is handled by verifyProjectMembership and verifyProjectRole middleware
+    // This ensures the user is a member with admin role (Requirements 9.2, 9.5)
+    // verifyProjectMembership ensures admin is a member of the project (Requirement 9.5)
+    // verifyProjectRole(['admin']) ensures only admins can remove members (Requirement 9.2)
+
+    // Find the membership (Requirement 9.3)
     const membership = await ProjectMember.findOne({
         project: projectId,
         user: userId
     });
 
+    // Handle non-existent members appropriately (Requirement 9.3)
     if (!membership) {
         throw new ApiError(404, "Member not found in this project");
     }
 
-    // Delete the membership
+    // Delete the membership (Requirement 9.1)
+    // Note: Historical data (tasks, notes) created by this member is preserved (Requirement 9.4)
+    // Only the membership record is deleted, not the user's contributions
     await ProjectMember.findByIdAndDelete(membership._id);
 
     res.status(200).json(

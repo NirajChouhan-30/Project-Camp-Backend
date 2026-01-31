@@ -4,6 +4,8 @@ import { ApiResponse } from "../utils/api-response.js";
 import { Task } from "../models/task.models.js";
 import { Subtask } from "../models/subtask.models.js";
 import { User } from "../models/user.models.js";
+import fs from "fs";
+import path from "path";
 
 /**
  * Create a new task (Admin or Project Admin only)
@@ -157,6 +159,20 @@ export const deleteTask = asyncHandler(async (req, res) => {
         throw new ApiError(404, "Task not found");
     }
 
+    // Delete all attachment files from filesystem
+    if (task.attachments && task.attachments.length > 0) {
+        task.attachments.forEach(attachment => {
+            try {
+                if (attachment.localPath && fs.existsSync(attachment.localPath)) {
+                    fs.unlinkSync(attachment.localPath);
+                }
+            } catch (error) {
+                console.error("Error deleting attachment file:", error);
+                // Continue even if file deletion fails
+            }
+        });
+    }
+
     // Cascade deletion: Delete all subtasks associated with this task
     await Subtask.deleteMany({ task: taskId });
 
@@ -295,5 +311,81 @@ export const deleteSubtask = asyncHandler(async (req, res) => {
 
     res.status(200).json(
         new ApiResponse(200, null, "Subtask deleted successfully")
+    );
+});
+
+/**
+ * Upload attachments to a task (Admin or Project Admin only)
+ * POST /api/v1/tasks/:projectId/t/:taskId/attachments
+ */
+export const uploadTaskAttachments = asyncHandler(async (req, res) => {
+    const { projectId, taskId } = req.params;
+
+    // Verify task exists and belongs to the project
+    const task = await Task.findOne({ _id: taskId, project: projectId });
+
+    if (!task) {
+        throw new ApiError(404, "Task not found");
+    }
+
+    // Check if files were uploaded
+    if (!req.files || req.files.length === 0) {
+        throw new ApiError(400, "No files uploaded");
+    }
+
+    // Process uploaded files
+    const attachments = req.files.map(file => ({
+        url: `/images/${file.filename}`,
+        localPath: file.path,
+        mimetype: file.mimetype,
+        size: file.size
+    }));
+
+    // Add attachments to task
+    task.attachments.push(...attachments);
+    await task.save();
+
+    res.status(200).json(
+        new ApiResponse(200, { attachments }, "Files uploaded successfully")
+    );
+});
+
+/**
+ * Delete a specific attachment from a task (Admin or Project Admin only)
+ * DELETE /api/v1/tasks/:projectId/t/:taskId/attachments/:attachmentId
+ */
+export const deleteTaskAttachment = asyncHandler(async (req, res) => {
+    const { projectId, taskId, attachmentId } = req.params;
+
+    // Verify task exists and belongs to the project
+    const task = await Task.findOne({ _id: taskId, project: projectId });
+
+    if (!task) {
+        throw new ApiError(404, "Task not found");
+    }
+
+    // Find the attachment
+    const attachment = task.attachments.id(attachmentId);
+
+    if (!attachment) {
+        throw new ApiError(404, "Attachment not found");
+    }
+
+    // Delete the file from filesystem
+    try {
+        if (attachment.localPath && fs.existsSync(attachment.localPath)) {
+            fs.unlinkSync(attachment.localPath);
+        }
+    } catch (error) {
+        console.error("Error deleting file:", error);
+        // Continue even if file deletion fails
+    }
+
+    // Remove attachment from task
+    task.attachments.pull(attachmentId);
+    await task.save();
+
+    res.status(200).json(
+        new ApiResponse(200, null, "Attachment deleted successfully")
     );
 });

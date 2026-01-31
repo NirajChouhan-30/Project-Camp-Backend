@@ -30,7 +30,7 @@ router.route("/:projectId/members")
     .get(verifyJWT, verifyProjectMembership, getProjectMembers);
 
 router.route("/:projectId/members/:userId")
-    .put(verifyJWT, verifyRoles(['admin']), updateProjectMemberRole)
-    .delete(verifyJWT, verifyRoles(['admin']), removeProjectMember);
+    .put(verifyJWT, verifyProjectMembership, verifyProjectRole(['admin']), updateProjectMemberRole)
+    .delete(verifyJWT, verifyProjectMembership, verifyProjectRole(['admin']), removeProjectMember);
 
 export default router;
